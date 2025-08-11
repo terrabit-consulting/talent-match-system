@@ -1,4 +1,3 @@
-import openai
 import streamlit as st
 import time
 import fitz  # PyMuPDF
@@ -7,26 +6,31 @@ import pandas as pd
 import re
 import io
 import spacy
+import google.generativeai as genai
+
+# ---------- Setup ----------
+st.set_page_config(page_title="Resume Matcher GPT", layout="centered")
 
 @st.cache_resource
 def load_spacy_model():
     return spacy.load("en_core_web_sm")
 
 nlp = load_spacy_model()
-client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-def call_gpt_with_fallback(prompt):
+# Configure Gemini (free API)
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+# Use "gemini-1.5-flash" for free/fast; switch to "gemini-1.5-pro" if you want higher quality
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+def call_gemini(prompt: str) -> str:
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        return response.choices[0].message.content.strip()
+        resp = gemini_model.generate_content(prompt)
+        return (getattr(resp, "text", "") or "").strip()
     except Exception as e:
-        st.error(f"❌ GPT-4o failed. {str(e)}")
-        return "⚠️ GPT processing failed."
+        st.error(f"❌ Gemini API failed: {str(e)}")
+        return "⚠️ Gemini processing failed."
 
+# ---------- File reading ----------
 def read_pdf(file):
     text = ""
     with fitz.open(stream=file.read(), filetype="pdf") as doc:
@@ -63,8 +67,9 @@ def read_file(file):
     else:
         return file.read().decode("utf-8", errors="ignore")
 
+# ---------- Extraction helpers ----------
 def extract_email(text):
-    match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", text)
+    match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
     return match.group() if match else "Not found"
 
 def extract_candidate_name_from_table(text):
@@ -108,7 +113,7 @@ Resume:
 
 Return only the name.
 """
-        name = call_gpt_with_fallback(prompt)
+        name = call_gemini(prompt)
         suspicious_keywords = ["java", "python", "developer", "resume", "engineer", "servers"]
         if (
             not name or
@@ -133,6 +138,7 @@ def extract_candidate_name(text, filename):
 
     return improved_extract_candidate_name(text, filename)
 
+# ---------- LLM tasks ----------
 def compare_resume(jd_text, resume_text, candidate_name):
     prompt = f"""
 You are a Recruiter Assistant bot.
@@ -155,7 +161,7 @@ Job Description:
 Resume:
 {resume_text}
 """
-    return call_gpt_with_fallback(prompt)
+    return call_gemini(prompt)
 
 def generate_followup(jd_text, resume_text):
     prompt = f"""
@@ -170,10 +176,9 @@ Job Description:
 Resume:
 {resume_text}
 """
-    return call_gpt_with_fallback(prompt)
+    return call_gemini(prompt)
 
-# Streamlit UI
-st.set_page_config(page_title="Resume Matcher GPT", layout="centered")
+# ---------- UI ----------
 st.title("📌 Terrabit Consulting Talent Match System")
 st.write("Upload a JD and multiple resumes. Get match scores, red flags, and follow-up messaging.")
 
