@@ -154,8 +154,10 @@ def compare_resume(jd_text, resume_text, candidate_name):
 You are a recruiter assistant. Compare the resume to the JD and produce STRICT Markdown in the EXACT format below.
 
 Formatting rules (MUST FOLLOW):
-- Use these headings and nothing else.
-- Score must be an INTEGER 0–100.
+- Use ** for all section labels (Name, Score, Role Match, Skill Match, Major Gaps, Warning).
+- Each label must be on its own line — do not merge Name and Score together.
+- Score must be in this exact form: **Score**: [NN]%
+- Always put Role Match, Skill Match, and Major Gaps as separate bolded labels.
 - Keep bullets concise. No tables. No extra sections.
 
 ---BEGIN TEMPLATE---
@@ -163,11 +165,11 @@ Formatting rules (MUST FOLLOW):
 **Score**: [NN]%
 
 **Reason**:
-- Role Match: <one sentence>
-- Skill Match: <matched & missing skills in 1–2 bullets>
-- Major Gaps: <key gaps in 1–2 bullets>
+- **Role Match**: <one sentence>
+- **Skill Match**: <matched & missing skills in 1–2 bullets>
+- **Major Gaps**: <key gaps in 1–2 bullets>
 
-Warning: <ONLY include this single line if Score < 70%; otherwise omit>
+**Warning**: <ONLY include this single line if Score < 70%; otherwise omit>
 ---END TEMPLATE---
 
 Job Description:
@@ -322,3 +324,4 @@ if st.session_state["summary"]:
         file_name="resume_match_summary.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
