@@ -24,7 +24,7 @@ nlp = load_spacy_model()
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 gemini_model = genai.GenerativeModel(
-    "gemini-1.5-flash",  # fast & free; switch to "gemini-1.5-pro" if you need higher quality
+    "gemini-1.5-flash",  # fast & free; switch to "gemini-1.5-pro" if needed
     generation_config={
         "temperature": 0,
         "top_p": 0.1,
@@ -49,6 +49,28 @@ def call_gemini(prompt: str) -> str:
     except Exception as e:
         st.error(f"❌ Gemini API failed: {str(e)}")
         return "⚠️ Gemini processing failed."
+
+# ---------- Markdown enforcement ----------
+def enforce_markdown(md: str) -> str:
+    """Force exact Markdown: separate Name/Score lines, bold labels, normalize score."""
+    if not md:
+        return md
+
+    # Put **Score** on a new line if it appears after **Name** on the same line
+    md = re.sub(r"(\*\*Name\*\*:[^\n]*?)\s+(?=\*\*Score\*\*:)", r"\1\n", md)
+
+    # Ensure the labels in bullets are bold (case-insensitive)
+    md = re.sub(r"(?im)^(\s*-\s*)role match\s*:", r"\1**Role Match**:", md)
+    md = re.sub(r"(?im)^(\s*-\s*)skill match\s*:", r"\1**Skill Match**:", md)
+    md = re.sub(r"(?im)^(\s*-\s*)major gaps\s*:", r"\1**Major Gaps**:", md)
+
+    # If the model forgot bold in the "Reason" heading, keep as-is; bullets carry the bold labels
+
+    # Normalize score formatting just in case
+    md = re.sub(r"\*\*Score\*\*:\s*\[(\d{1,3})\]%", r"**Score**: [\1]%", md)
+    md = re.sub(r"\*\*Score\*\*:\s*(\d{1,3})%", r"**Score**: [\1]%", md)
+
+    return md.strip()
 
 # ---------- File reading ----------
 def read_pdf(file):
@@ -178,7 +200,8 @@ Job Description:
 Resume:
 {resume_text}
 """
-    return call_gemini(prompt)
+    raw = call_gemini(prompt)
+    return enforce_markdown(raw)
 
 def generate_followup(jd_text, resume_text, candidate_name):
     prompt = f"""
@@ -265,6 +288,8 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
 
         with st.spinner(f"🔎 Analyzing {correct_name}..."):
             result = compare_resume(jd_text, resume_text, correct_name)
+            # Extra safety (should be redundant, but fine to keep)
+            result = enforce_markdown(result)
 
         # Robust score extraction
         score_match = re.search(r"\*\*Score\*\*:\s*\[(\d{1,3})\]%", result)
@@ -324,4 +349,3 @@ if st.session_state["summary"]:
         file_name="resume_match_summary.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
