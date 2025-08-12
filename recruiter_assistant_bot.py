@@ -8,24 +8,44 @@ import io
 import spacy
 import google.generativeai as genai
 
-# ---------- Setup ----------
-st.set_page_config(page_title="Resume Matcher GPT", layout="centered")
+# ---------- Page ----------
+st.set_page_config(page_title="Resume Matcher (Gemini)", layout="centered")
+st.title("📌 Terrabit Consulting Talent Match System")
+st.write("Upload a JD and multiple resumes. Get match scores, red flags, and follow-up messaging.")
 
+# ---------- NLP ----------
 @st.cache_resource
 def load_spacy_model():
     return spacy.load("en_core_web_sm")
 
 nlp = load_spacy_model()
 
-# Configure Gemini (free API)
+# ---------- Gemini (free API) ----------
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-# Use "gemini-1.5-flash" for free/fast; switch to "gemini-1.5-pro" if you want higher quality
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+gemini_model = genai.GenerativeModel(
+    "gemini-1.5-flash",  # fast & free; switch to "gemini-1.5-pro" if you need higher quality
+    generation_config={
+        "temperature": 0,
+        "top_p": 0.1,
+        "top_k": 1,
+        "max_output_tokens": 1024
+    }
+)
 
 def call_gemini(prompt: str) -> str:
+    """Single LLM caller (Gemini). Returns clean text only."""
     try:
         resp = gemini_model.generate_content(prompt)
-        return (getattr(resp, "text", "") or "").strip()
+        text = (getattr(resp, "text", "") or "").strip()
+        # Remove accidental code fences if present
+        if text.startswith("```"):
+            text = text.strip("`")
+            lines = text.splitlines()
+            if lines and lines[0].lower().startswith(("markdown", "txt", "json")):
+                lines = lines[1:]
+            text = "\n".join(lines).strip()
+        return text
     except Exception as e:
         st.error(f"❌ Gemini API failed: {str(e)}")
         return "⚠️ Gemini processing failed."
@@ -90,28 +110,20 @@ def improved_extract_candidate_name(text, filename):
     try:
         trimmed_text = "\n".join(text.splitlines()[:50])
         prompt = f"""
-You are a resume parser assistant.
+You are a resume parser. Extract ONLY the candidate's full name.
 
-Extract the candidate's **full name only** from the following resume text.
+Rules:
+- Return ONLY the name text (no labels, no quotes, no punctuation).
+- 2 to 4 words, each starting with a capital letter (e.g., "Amit Kumar", "Neha Reddy Varma").
+- Prefer explicit cues: "Candidate Name", "Resume of <Name>", headers/footers.
+- Ignore job titles, skills, technologies, locations, emails, phone numbers, company names.
+- If no valid name, return exactly: Name Not Found
 
-✅ Look for patterns like:
-- Candidate Name:
-- Resume of <Name>
-- Table headers or footers
-- A standalone name at the top (2–4 words, capitalized)
-
-❌ Do NOT return:
-- Job titles (e.g., Developer, Manager)
-- Technical terms (e.g., DB Servers, Azure, Python)
-- Locations (e.g., Bangalore, India)
-- Email addresses or phone numbers
-
-If no valid name is found, respond only with: Name Not Found
-
-Resume:
+Text to analyze (first 50 lines):
 {trimmed_text}
 
-Return only the name.
+Output:
+<name only or "Name Not Found">
 """
         name = call_gemini(prompt)
         suspicious_keywords = ["java", "python", "developer", "resume", "engineer", "servers"]
@@ -131,29 +143,32 @@ def extract_candidate_name(text, filename):
     table_name = extract_candidate_name_from_table(text)
     if table_name:
         return table_name
-
     footer_name = extract_candidate_name_from_footer(text)
     if footer_name:
         return footer_name
-
     return improved_extract_candidate_name(text, filename)
 
 # ---------- LLM tasks ----------
 def compare_resume(jd_text, resume_text, candidate_name):
     prompt = f"""
-You are a Recruiter Assistant bot.
+You are a recruiter assistant. Compare the resume to the JD and produce STRICT Markdown in the EXACT format below.
 
-Compare the following resume to the job description and return the result in the following format:
+Formatting rules (MUST FOLLOW):
+- Use these headings and nothing else.
+- Score must be an INTEGER 0–100.
+- Keep bullets concise. No tables. No extra sections.
 
+---BEGIN TEMPLATE---
 **Name**: {candidate_name}
-**Score**: [Match Score]%
+**Score**: [NN]%
 
 **Reason**:
-- Role Match: (Brief explanation)
-- Skill Match: (Matched or missing skills)
-- Major Gaps: (What is completely missing or irrelevant)
+- Role Match: <one sentence>
+- Skill Match: <matched & missing skills in 1–2 bullets>
+- Major Gaps: <key gaps in 1–2 bullets>
 
-Warning: Add only if score < 70%
+Warning: <ONLY include this single line if Score < 70%; otherwise omit>
+---END TEMPLATE---
 
 Job Description:
 {jd_text}
@@ -163,25 +178,51 @@ Resume:
 """
     return call_gemini(prompt)
 
-def generate_followup(jd_text, resume_text):
+def generate_followup(jd_text, resume_text, candidate_name):
     prompt = f"""
-Based on the resume and job description below, generate:
-1. WhatsApp message (casual)
-2. Email message (formal)
-3. Screening questions (3-5)
+You are a recruiter at Terrabit Consulting writing to a candidate named {candidate_name}.
+All outputs must be addressed to the candidate (never to a recruiter) and must be short and actionable.
 
+Goals:
+- Invite {candidate_name} to a quick screening call for the best-fit role inferred from the JD.
+- Personalize with 1–2 strengths found in the resume.
+- Ask for availability and provide 2–3 time-slot options.
+- Ask only for info that is missing/uncertain in the resume.
+- Keep messages concise (4–6 lines each).
+
+Strict format (use these exact section headings, no extras):
+
+---BEGIN OUTPUT---
+### WhatsApp Message to Candidate
+<friendly, concise outreach to {candidate_name}; mention inferred role; 2–3 time slots; ask to confirm phone/email if missing>
+
+### Email to Candidate
+Subject: Quick chat about a {{<role>}} opportunity at Terrabit Consulting
+Dear {candidate_name},
+<3–5 lines: why we’re reaching out based on their resume, key fit, ask for 2–3 preferred slots this week, and a polite close with signature placeholder>
+
+### Screening Questions (Tailored)
+- <Q1 based on core skills in the JD; confirm years/level if unclear from resume>
+- <Q2 about a missing or weak skill vs JD>
+- <Q3 about domain/tools mentioned in JD>
+- <Q4 optional about availability/notice period>
+- <Q5 optional about location/remote preference if relevant>
+---END OUTPUT---
+
+Information to use:
 Job Description:
 {jd_text}
 
 Resume:
 {resume_text}
+
+Rules:
+- Do NOT say "my resume is attached" or write as if you are the candidate.
+- Keep tone professional and positive.
 """
     return call_gemini(prompt)
 
-# ---------- UI ----------
-st.title("📌 Terrabit Consulting Talent Match System")
-st.write("Upload a JD and multiple resumes. Get match scores, red flags, and follow-up messaging.")
-
+# ---------- Session state ----------
 if "results" not in st.session_state:
     st.session_state["results"] = []
 if "processed_resumes" not in st.session_state:
@@ -193,14 +234,16 @@ if "jd_file" not in st.session_state:
 if "summary" not in st.session_state:
     st.session_state["summary"] = []
 
+# Reset
 if st.button("🔁 Start New Matching Session"):
     st.session_state.clear()
     st.rerun()
 
+# Uploaders
 jd_file = st.file_uploader("📄 Upload Job Description", type=["txt", "pdf", "docx"], key="jd_uploader")
 resume_files = st.file_uploader("📑 Upload Candidate Resumes", type=["txt", "pdf", "docx"], accept_multiple_files=True, key="resume_uploader")
 
-# ✅ Store JD only once and reuse for every resume
+# ✅ Store JD once
 if jd_file and not st.session_state.get("jd_text"):
     jd_text = read_file(jd_file)
     st.session_state["jd_text"] = jd_text
@@ -208,6 +251,7 @@ if jd_file and not st.session_state.get("jd_text"):
 
 jd_text = st.session_state.get("jd_text", "")
 
+# Run
 if st.button("🚀 Run Matching") and jd_text and resume_files:
     for resume_file in resume_files:
         if resume_file.name in st.session_state["processed_resumes"]:
@@ -220,7 +264,10 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
         with st.spinner(f"🔎 Analyzing {correct_name}..."):
             result = compare_resume(jd_text, resume_text, correct_name)
 
-        score_match = re.search(r"Score\*\*: ?([0-9]+)%", result)
+        # Robust score extraction
+        score_match = re.search(r"\*\*Score\*\*:\s*\[(\d{1,3})\]%", result)
+        if not score_match:
+            score_match = re.search(r"\*\*Score\*\*:\s*(\d{1,3})%", result)
         score = int(score_match.group(1)) if score_match else 0
 
         st.session_state["results"].append({
@@ -238,6 +285,7 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
             "Score": score
         })
 
+# Results
 for entry in st.session_state["results"]:
     st.markdown("---")
     st.subheader(f"📌 {entry['correct_name']}")
@@ -254,10 +302,11 @@ for entry in st.session_state["results"]:
 
     if st.button(f"✉️ Generate Follow-up for {entry['correct_name']}", key=f"followup_{entry['correct_name']}"):
         with st.spinner("Generating messages..."):
-            followup = generate_followup(jd_text, entry["resume_text"])
+            followup = generate_followup(jd_text, entry["resume_text"], entry["correct_name"])
             st.markdown("---")
             st.markdown(followup, unsafe_allow_html=True)
 
+# Summary + download
 if st.session_state["summary"]:
     st.markdown("### 📊 Summary of All Candidates")
     df_summary = pd.DataFrame(st.session_state["summary"]).sort_values(by="Score", ascending=False)
