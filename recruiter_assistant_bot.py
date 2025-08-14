@@ -1,22 +1,15 @@
-# resume_matcher_gemini_gpt_style.py
+# resume_matcher_gemini_gpt_style_strict.py
 import streamlit as st
 import fitz  # PyMuPDF
 import docx
 import pandas as pd
 import re, io
-import spacy
 import google.generativeai as genai
 
 # -------------------- Page --------------------
 st.set_page_config(page_title="Resume Matcher (Gemini, GPT-style)", layout="centered")
 st.title("📌 Terrabit Consulting Talent Match System")
 st.write("Upload a JD and multiple resumes. Get match scores, red flags, and follow-up messaging.")
-
-# -------------------- NLP --------------------
-@st.cache_resource
-def load_spacy_model():
-    return spacy.load("en_core_web_sm")
-nlp = load_spacy_model()
 
 # -------------------- Gemini --------------------
 if "GEMINI_API_KEY" not in st.secrets:
@@ -32,14 +25,24 @@ gemini = genai.GenerativeModel(
         "temperature": 0.0,   # deterministic
         "top_p": 0.1,
         "top_k": 1,
-        "max_output_tokens": 1200
+        "max_output_tokens": 1400
     }
 )
 
 def call_gemini(prompt: str) -> str:
+    """LLM caller with light code-fence cleanup."""
     try:
         resp = gemini.generate_content(prompt)
-        return (getattr(resp, "text", "") or "").strip()
+        text = (getattr(resp, "text", "") or "").strip()
+        # Strip accidental code fences
+        if text.startswith("```"):
+            text = text.strip("`")
+            lines = text.splitlines()
+            # drop "markdown"/"txt" language hint line if present
+            if lines and lines[0].lower().startswith(("markdown", "txt", "json")):
+                lines = lines[1:]
+            text = "\n".join(lines).strip()
+        return text
     except Exception as e:
         st.error(f"❌ Gemini failed: {e}")
         return "⚠️ Gemini processing failed."
@@ -124,40 +127,74 @@ def extract_candidate_name(text, filename):
     )
 
 def enforce_markdown(md: str) -> str:
-    """Make sure the output has separate Name and Score lines and bold labels."""
+    """Ensure separate Name/Score lines and normalize score token."""
     if not md:
         return md
+    # put Score on its own line if model merged it
     md = re.sub(r"(\*\*Name\*\*:[^\n]*?)\s+(?=\*\*Score\*\*:)", r"\1\n", md)
-    # normalize score format
-    md = re.sub(r"\*\*Score\*\*:\s*(\d{1,3})%", r"**Score**: [\1]%", md)
+    # normalize score formats to **Score**: [NN]%
     md = re.sub(r"\*\*Score\*\*:\s*\[(\d{1,3})\]\s*%", r"**Score**: [\1]%", md)
+    md = re.sub(r"\*\*Score\*\*:\s*(\d{1,3})\s*%", r"**Score**: [\1]%", md)
     return md.strip()
+
+def extract_score(md: str) -> int:
+    for pat in [
+        r"\*\*Score\*\*:\s*\[(\d{1,3})\]\s*%",
+        r"\*\*Score\*\*:\s*(\d{1,3})\s*%",
+        r"Score\*\*:\s*(\d{1,3})\s*%"
+    ]:
+        m = re.search(pat, md)
+        if m:
+            try:
+                return int(m.group(1))
+            except:
+                pass
+    return 0
 
 # -------------------- LLM tasks (GPT-style prompts) --------------------
 RUBRIC = """
-SCORING RULES (be consistent, 0–100%):
-- Skills/Tools/Technologies match (including tool→family mapping) = 60%
-  * Treat tools as families: Jenkins/GitHub Actions/GitLab CI/Azure DevOps ⇒ CI/CD
-  * Selenium/Playwright/Cypress/Appium ⇒ Test Automation
-  * Postman/REST Assured/SoapUI ⇒ API Testing
-  * JMeter/k6/LoadRunner ⇒ Performance Testing
-  * Oracle/PL/SQL/SQL Server/Postgres/MySQL ⇒ SQL/Database
-  * Docker ⇒ Containers; Kubernetes/OpenShift ⇒ Kubernetes
-  * Cloud services imply their provider (EC2/S3 ⇒ AWS; AKS ⇒ Azure; GKE/BigQuery ⇒ GCP)
-- Role/Area alignment (dev vs testing vs automation vs ops vs data vs security) = 20%
-- Experience/years vs JD minimum (if mentioned) = 10%
-- Domain/location fit (if mentioned) = 10%
+SCORING & CLASSIFICATION (be consistent, 0–100%):
+
+Step 1 — Detect areas (decide from TITLES & RESPONSIBILITIES, not tools):
+- Resume PRIMARY AREA (exactly one): dev | test | automation | ops | data | security | cloud
+  * Use titles & verbs:
+    - dev: developer/software engineer/backend/full-stack; build/design/implement/architect/features/services/APIs
+    - test: tester/QA/quality assurance/manual testing; test cases/execution/defect triage
+    - automation: SDET/test automation; builds automated test frameworks (Selenium/Playwright/etc.) as main role
+    - ops: SRE/DevOps/production ops; incidents/runbooks/monitoring/release ops
+    - data: data engineer/ETL/warehouse/pipelines
+    - security: security engineer/AppSec/VAPT
+    - cloud: cloud/infra architect/engineer (infra focus)
+- JD TARGET AREA: infer from JD titles & responsibilities the same way.
+IMPORTANT: Tools alone (Jenkins, SonarQube, Burp, Postman, JMeter, etc.) DO NOT make a resume “testing”.
+If titles/responsibilities say "Software Engineer / Developer" and work is building software/services, classify as **dev** even if some testing or DevSecOps tools were used.
+
+Step 2 — Scoring weights:
+- Area alignment (PRIMARY AREA vs JD TARGET AREA) = 40%
+  * Same area = 1.0; adjacent (dev vs automation) = 0.6; otherwise = 0.2
+  * If areas differ, HARD CAP the total final score at **60%**.
+- Skills/families match = 40%
+  * Map tools→families: Jenkins/GitHub Actions/GitLab CI/Azure DevOps ⇒ CI/CD
+    Selenium/Playwright/Cypress/Appium ⇒ Test Automation
+    JMeter/k6/LoadRunner ⇒ Performance Testing
+    Postman/REST Assured/SoapUI ⇒ API Testing
+    Oracle/PL/SQL/SQL Server/Postgres/MySQL ⇒ SQL/Database
+    Docker ⇒ Containers; Kubernetes/OpenShift ⇒ Kubernetes
+    Cloud services imply provider (EC2/S3 ⇒ AWS; AKS ⇒ Azure; GKE/BigQuery ⇒ GCP)
+- Years vs JD minimum (if mentioned) = 15%
+- Domain/location fit (if mentioned) = 5%
 
 OUTPUT FORMAT (STRICT):
 **Name**: <candidate_name>
 **Score**: [NN]%
 
 **Reason**:
-- **Role Match**: <one sentence on role alignment>
-- **Skill Match**: <matched & missing skills/families in 1–2 bullets>
-- **Major Gaps**: <key gaps in 1–2 bullets>
+- **Role Match**: Primary area detected: <dev|test|automation|ops|data|security|cloud>. JD area: <...>. Alignment: <high|medium|low> with one-sentence justification based on titles/responsibilities.
+- **Skill Match**: <1–2 bullets: matched & missing skills/families>
+- **Major Gaps**: <1–2 bullets of critical gaps; if area mismatch, include “Profile is primarily <area>, JD is <area>”>
 
-**Warning**: <include only if Score < 70%; otherwise omit>
+**Warning**: include ONLY if Score < 70%.
+You must implement the HARD CAP when areas differ; do not exceed 60% in that case.
 """
 
 def compare_resume(jd_text, resume_text, candidate_name):
@@ -253,12 +290,7 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
             result = enforce_markdown(result)
 
         # Robust score extraction
-        score_match = re.search(r"\*\*Score\*\*:\s*\[(\d{1,3})\]\s*%", result)
-        if not score_match:
-            score_match = re.search(r"\*\*Score\*\*:\s*(\d{1,3})\s*%", result)
-        if not score_match:
-            score_match = re.search(r"Score\*\*: ?(\d{1,3})%", result)  # fallback
-        score = int(score_match.group(1)) if score_match else 0
+        score = extract_score(result)
 
         st.session_state["results"].append({
             "correct_name": correct_name,
@@ -268,6 +300,7 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
             "resume_text": resume_text
         })
         st.session_state["processed_resumes"].add(resume_file.name)
+
         st.session_state["summary"].append({
             "Candidate Name": correct_name,
             "Email": correct_email,
@@ -285,7 +318,7 @@ for entry in st.session_state["results"]:
     if score < 50:
         st.error("❌ Not suitable – Major role mismatch")
     elif score < 70:
-        st.warning("⚠️ Consider with caution – Lacks core skills")
+        st.warning("⚠️ Consider with caution – Lacks core skills / area alignment")
     else:
         st.success("✅ Strong match – Good alignment with JD")
 
