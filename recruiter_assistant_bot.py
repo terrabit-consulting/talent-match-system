@@ -1,12 +1,11 @@
 import streamlit as st
-import time
+import time, io, re, json
 import fitz  # PyMuPDF
 import docx
 import pandas as pd
-import re
-import io
 import spacy
 import google.generativeai as genai
+from collections import Counter
 
 # ---------- Page ----------
 st.set_page_config(page_title="Resume Matcher (Gemini)", layout="centered")
@@ -17,14 +16,24 @@ st.write("Upload a JD and multiple resumes. Get match scores, red flags, and fol
 @st.cache_resource
 def load_spacy_model():
     return spacy.load("en_core_web_sm")
-
 nlp = load_spacy_model()
 
-# ---------- Gemini (free API) ----------
+# ---------- Gemini ----------
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-gemini_model = genai.GenerativeModel(
-    "gemini-1.5-flash",  # fast & free; switch to "gemini-1.5-pro" if needed
+gemini_json = genai.GenerativeModel(
+    "gemini-1.5-flash",
+    generation_config={
+        "temperature": 0,
+        "top_p": 0.1,
+        "top_k": 1,
+        "max_output_tokens": 2048,
+        "response_mime_type": "application/json",  # force JSON
+    }
+)
+
+gemini_text = genai.GenerativeModel(
+    "gemini-1.5-flash",
     generation_config={
         "temperature": 0,
         "top_p": 0.1,
@@ -33,73 +42,59 @@ gemini_model = genai.GenerativeModel(
     }
 )
 
-def call_gemini(prompt: str) -> str:
-    """Single LLM caller (Gemini). Returns clean text only."""
+def call_json(prompt: str, schema_hint: dict) -> dict:
+    """Ask Gemini for JSON only; return parsed dict or {}."""
     try:
-        resp = gemini_model.generate_content(prompt)
-        text = (getattr(resp, "text", "") or "").strip()
-        # Remove accidental code fences if present
-        if text.startswith("```"):
-            text = text.strip("`")
-            lines = text.splitlines()
-            if lines and lines[0].lower().startswith(("markdown", "txt", "json")):
-                lines = lines[1:]
-            text = "\n".join(lines).strip()
-        return text
+        # Lightly steer with a minimal schema hint inside the prompt
+        resp = gemini_json.generate_content(
+            f"You must return valid JSON only. Follow this json schema shape (keys only, types implied):\n{json.dumps(schema_hint, indent=2)}\n\n---\n{prompt}"
+        )
+        text = getattr(resp, "text", "") or ""
+        return json.loads(text)
     except Exception as e:
-        st.error(f"❌ Gemini API failed: {str(e)}")
-        return "⚠️ Gemini processing failed."
+        st.error(f"❌ Gemini JSON failed: {e}")
+        return {}
 
-# ---------- Markdown enforcement ----------
-def enforce_markdown(md: str) -> str:
-    """Force exact Markdown: separate Name/Score lines, bold labels, normalize score."""
-    if not md:
-        return md
+def call_text(prompt: str) -> str:
+    try:
+        resp = gemini_text.generate_content(prompt)
+        return (getattr(resp, "text", "") or "").strip()
+    except Exception as e:
+        st.error(f"❌ Gemini text failed: {e}")
+        return ""
 
-    # Put **Score** on a new line if it appears after **Name** on the same line
-    md = re.sub(r"(\*\*Name\*\*:[^\n]*?)\s+(?=\*\*Score\*\*:)", r"\1\n", md)
-
-    # Ensure the labels in bullets are bold (case-insensitive)
-    md = re.sub(r"(?im)^(\s*-\s*)role match\s*:", r"\1**Role Match**:", md)
-    md = re.sub(r"(?im)^(\s*-\s*)skill match\s*:", r"\1**Skill Match**:", md)
-    md = re.sub(r"(?im)^(\s*-\s*)major gaps\s*:", r"\1**Major Gaps**:", md)
-
-    # If the model forgot bold in the "Reason" heading, keep as-is; bullets carry the bold labels
-
-    # Normalize score formatting just in case
-    md = re.sub(r"\*\*Score\*\*:\s*\[(\d{1,3})\]%", r"**Score**: [\1]%", md)
-    md = re.sub(r"\*\*Score\*\*:\s*(\d{1,3})%", r"**Score**: [\1]%", md)
-
-    return md.strip()
+# ---------- Normalization ----------
+def normalize_text(t: str, max_chars=40000) -> str:
+    if not t: return ""
+    t = t.replace("\x00", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = t.strip()
+    return t[:max_chars]
 
 # ---------- File reading ----------
 def read_pdf(file):
     text = ""
     with fitz.open(stream=file.read(), filetype="pdf") as doc:
         for page in doc:
-            text += page.get_text()
+            text += page.get_text("text")
     return text
 
 def read_docx(file):
-    doc = docx.Document(file)
-    full_text = []
-
-    for para in doc.paragraphs:
-        full_text.append(para.text)
-
-    for table in doc.tables:
+    d = docx.Document(file)
+    parts = []
+    for p in d.paragraphs:
+        parts.append(p.text)
+    for table in d.tables:
         for row in table.rows:
-            for cell in row.cells:
-                full_text.append(cell.text)
-
+            parts.extend([c.text for c in row.cells])
     try:
-        section = doc.sections[0]
+        section = d.sections[0]
         for para in section.footer.paragraphs:
-            full_text.append(para.text)
+            parts.append(para.text)
     except Exception:
         pass
-
-    return "\n".join(full_text)
+    return "\n".join(parts)
 
 def read_file(file):
     if file.type == "application/pdf":
@@ -109,117 +104,160 @@ def read_file(file):
     else:
         return file.read().decode("utf-8", errors="ignore")
 
-# ---------- Extraction helpers ----------
+# ---------- Name/Email ----------
 def extract_email(text):
-    match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
-    return match.group() if match else "Not found"
+    m = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
+    return m.group() if m else "Not found"
 
 def extract_candidate_name_from_table(text):
     matches = re.findall(r"(?i)Candidate Name\s*[\t:–-]*\s*(.+)", text)
     for match in matches:
-        name = match.strip().title()
-        if 2 <= len(name.split()) <= 4:
-            return name
+        nm = match.strip()
+        nm = re.sub(r"[^A-Za-z \-']", "", nm)
+        if 2 <= len(nm.split()) <= 4:
+            return nm.title()
     return None
 
 def extract_candidate_name_from_footer(text):
-    footer_match = re.search(r"(?i)Resume of\s+([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", text)
-    if footer_match:
-        return footer_match.group(1).strip().title()
-    return None
-
-def improved_extract_candidate_name(text, filename):
-    try:
-        trimmed_text = "\n".join(text.splitlines()[:50])
-        prompt = f"""
-You are a resume parser. Extract ONLY the candidate's full name.
-
-Rules:
-- Return ONLY the name text (no labels, no quotes, no punctuation).
-- 2 to 4 words, each starting with a capital letter (e.g., "Amit Kumar", "Neha Reddy Varma").
-- Prefer explicit cues: "Candidate Name", "Resume of <Name>", headers/footers.
-- Ignore job titles, skills, technologies, locations, emails, phone numbers, company names.
-- If no valid name, return exactly: Name Not Found
-
-Text to analyze (first 50 lines):
-{trimmed_text}
-
-Output:
-<name only or "Name Not Found">
-"""
-        name = call_gemini(prompt)
-        suspicious_keywords = ["java", "python", "developer", "resume", "engineer", "servers"]
-        if (
-            not name or
-            len(name.split()) > 5 or
-            any(word in name.lower() for word in suspicious_keywords) or
-            "@" in name or
-            name.lower().startswith("name not found")
-        ):
-            return "Name Not Found"
-        return name.strip().title()
-    except Exception:
-        return "Name Not Found"
+    m = re.search(r"(?i)Resume of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", text)
+    return m.group(1).strip().title() if m else None
 
 def extract_candidate_name(text, filename):
-    table_name = extract_candidate_name_from_table(text)
-    if table_name:
-        return table_name
-    footer_name = extract_candidate_name_from_footer(text)
-    if footer_name:
-        return footer_name
-    return improved_extract_candidate_name(text, filename)
+    # 1) explicit markers
+    for fn in (extract_candidate_name_from_table, extract_candidate_name_from_footer):
+        nm = fn(text)
+        if nm: return nm
+    # 2) heuristic: first lines likely name
+    first = "\n".join(text.splitlines()[:15])
+    m = re.search(r"(?m)^\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*$", first)
+    if m: return m.group(1).strip().title()
+    # 3) filename fallback
+    base = re.sub(r"\.(pdf|docx|txt)$", "", filename, flags=re.I)
+    base = re.sub(r"[_\-]+", " ", base)
+    cand = re.sub(r"[^A-Za-z \-']", " ", base).strip()
+    if 2 <= len(cand.split()) <= 4:
+        return cand.title()
+    # 4) final LLM fallback (strict)
+    prompt = f"""Return ONLY the full name from the text below.
+Rules: 2-4 words, capitalized words only. If not found, return exactly 'Name Not Found'.
+Text (first 60 lines):
+{first}
+"""
+    nm = call_text(prompt).strip()
+    if not nm or "not found" in nm.lower() or len(nm.split()) > 5:
+        return "Name Not Found"
+    return re.sub(r"[^A-Za-z \-']", "", nm).strip().title()
 
-# ---------- LLM tasks ----------
-def compare_resume(jd_text, resume_text, candidate_name):
-    prompt = f"""
-You are a recruiter assistant. Compare the resume to the JD and produce STRICT Markdown in the EXACT format below.
+# ---------- LLM extraction (JSON) ----------
+JD_SCHEMA = {
+  "role_titles": ["list of role titles from JD"],
+  "must_have_skills": ["list of hard skills/tools/frameworks"],
+  "nice_to_have_skills": ["list of optional skills"],
+  "min_years_core_stack": "integer years if specified else 0",
+  "domain_keywords": ["e.g., fintech, telecom, ecommerce"],
+  "location_keywords": ["city/country/remote"]
+}
 
-Formatting rules (MUST FOLLOW):
-- Use ** for all section labels (Name, Score, Role Match, Skill Match, Major Gaps, Warning).
-- Each label must be on its own line — do not merge Name and Score together.
-- Score must be in this exact form: **Score**: [NN]%
-- Always put Role Match, Skill Match, and Major Gaps as separate bolded labels.
-- Keep bullets concise. No tables. No extra sections.
+RESUME_SCHEMA = {
+  "role_titles": ["candidate past/current titles"],
+  "skills": ["hard skills/tools/frameworks"],
+  "years_overall": "integer estimate",
+  "years_core_stack": "integer estimate on JD core skills if possible",
+  "domain_keywords": ["industries mentioned"],
+  "location_keywords": ["locations mentioned"]
+}
 
----BEGIN TEMPLATE---
-**Name**: {candidate_name}
-**Score**: [NN]%
+def extract_jd_facts(jd_text: str) -> dict:
+    prompt = f"""Extract JD facts as JSON. Keep lists short and canonicalized (e.g., 'Java', 'Selenium', 'Oracle', 'CI/CD').
+JD:
+{jd_text}"""
+    data = call_json(prompt, JD_SCHEMA)
+    return data or {k: ([] if isinstance(v, list) else 0) for k,v in JD_SCHEMA.items()}
+
+def extract_resume_facts(resume_text: str) -> dict:
+    prompt = f"""Extract candidate facts as JSON. Canonicalize skills (e.g., 'Java', 'Selenium', 'Oracle', 'CI/CD').
+Resume:
+{resume_text}"""
+    data = call_json(prompt, RESUME_SCHEMA)
+    return data or {k: ([] if isinstance(v, list) else 0) for k,v in RESUME_SCHEMA.items()}
+
+# ---------- Scoring ----------
+def jaccard_weighted(a, b):
+    A, B = set([s.lower() for s in a]), set([s.lower() for s in b])
+    if not A and not B: return 0.0
+    inter = len(A & B); union = len(A | B)
+    return inter / union if union else 0.0
+
+def title_alignment(jd_titles, cv_titles):
+    jd = " ".join(jd_titles).lower()
+    cv = " ".join(cv_titles).lower()
+    keywords = ["qa", "quality", "tester", "testing", "sdet", "automation", "developer", "engineer"]
+    hits = sum(1 for k in keywords if k in jd and k in cv)
+    return min(hits / 3.0, 1.0)  # cap at 1
+
+def keyword_hit(jd_kw, cv_kw):
+    return 1.0 if set([x.lower() for x in jd_kw]) & set([y.lower() for y in cv_kw]) else 0.0
+
+def compute_score(jd, cv):
+    # Components
+    hard = jaccard_weighted(jd.get("must_have_skills", []), cv.get("skills", []))
+    exp_core = cv.get("years_core_stack", 0); min_core = jd.get("min_years_core_stack", 0)
+    exp_ratio = 1.0 if min_core == 0 else min(exp_core / max(min_core, 1), 1.25)  # small reward for exceeding
+    exp_ratio = min(exp_ratio, 1.0)
+
+    title = title_alignment(jd.get("role_titles", []), cv.get("role_titles", []))
+    domain = keyword_hit(jd.get("domain_keywords", []), cv.get("domain_keywords", []))
+    location = keyword_hit(jd.get("location_keywords", []), cv.get("location_keywords", []))
+
+    # Weights
+    score = (
+        0.50 * hard +
+        0.20 * exp_ratio +
+        0.10 * title +
+        0.10 * domain +
+        0.10 * location
+    )
+    return round(score * 100)
+
+def gaps_and_matches(jd, cv):
+    jd_must = set([s.lower() for s in jd.get("must_have_skills", [])])
+    cv_sk = set([s.lower() for s in cv.get("skills", [])])
+    matched = sorted([s for s in jd_must & cv_sk])
+    missing = sorted([s for s in jd_must - cv_sk])
+    return matched, missing
+
+# ---------- Rendering ----------
+def render_markdown(candidate_name, score, matched, missing, analysis_reason):
+    warn = "\n\n**Warning**: Score below 70% – candidate may not meet core testing specialization." if score < 70 else ""
+    md = f"""**Name**: {candidate_name}
+**Score**: [{score}]%
 
 **Reason**:
-- **Role Match**: <one sentence>
-- **Skill Match**: <matched & missing skills in 1–2 bullets>
-- **Major Gaps**: <key gaps in 1–2 bullets>
-
-**Warning**: <ONLY include this single line if Score < 70%; otherwise omit>
----END TEMPLATE---
-
-Job Description:
-{jd_text}
-
-Resume:
-{resume_text}
+- **Role Match**: {analysis_reason.get('role_match', 'Role alignment estimated from titles and responsibilities.')}
+- **Skill Match**: Matched skills: {', '.join(matched) if matched else 'None'}. Missing skills: {', '.join(missing) if missing else 'None'}.
+- **Major Gaps**: {analysis_reason.get('gaps', 'Missing required tools or insufficient years on core stack.' if score < 70 else 'No major gaps relative to JD.')}{warn}
 """
-    raw = call_gemini(prompt)
-    return enforce_markdown(raw)
+    return md.strip()
 
+def build_reason_text(jd, cv):
+    rm = "Experience overlaps with JD focus" if title_alignment(jd.get("role_titles", []), cv.get("role_titles", [])) >= 0.5 else "Resume focus differs from JD emphasis"
+    gaps = []
+    if compute_score(jd, cv) < 70:
+        if jd.get("min_years_core_stack", 0) > cv.get("years_core_stack", 0):
+            gaps.append("Insufficient years on core stack")
+        if not keyword_hit(jd.get("domain_keywords", []), cv.get("domain_keywords", [])):
+            gaps.append("Domain exposure not explicit")
+    return {"role_match": rm, "gaps": "; ".join(gaps) if gaps else "—"}
+
+# ---------- Follow-up ----------
 def generate_followup(jd_text, resume_text, candidate_name):
     prompt = f"""
 You are a recruiter at Terrabit Consulting writing to a candidate named {candidate_name}.
-All outputs must be addressed to the candidate (never to a recruiter) and must be short and actionable.
-
-Goals:
-- Invite {candidate_name} to a quick screening call for the best-fit role inferred from the JD.
-- Personalize with 1–2 strengths found in the resume.
-- Ask for availability and provide 2–3 time-slot options.
-- Ask only for info that is missing/uncertain in the resume.
-- Keep messages concise (4–6 lines each).
-
-Strict format (use these exact section headings, no extras):
+All outputs must be addressed to the candidate and concise.
 
 ---BEGIN OUTPUT---
 ### WhatsApp Message to Candidate
-<friendly, concise outreach to {candidate_name}; mention inferred role; 2–3 time slots; ask to confirm phone/email if missing>
+<friendly outreach; mention inferred role; 2–3 slots; ask to confirm phone/email if missing>
 
 ### Email to Candidate
 Subject: Quick chat about a {{<role>}} opportunity at Terrabit Consulting
@@ -227,25 +265,21 @@ Dear {candidate_name},
 <3–5 lines: why we’re reaching out based on their resume, key fit, ask for 2–3 preferred slots this week, and a polite close with signature placeholder>
 
 ### Screening Questions (Tailored)
-- <Q1 based on core skills in the JD; confirm years/level if unclear from resume>
-- <Q2 about a missing or weak skill vs JD>
-- <Q3 about domain/tools mentioned in JD>
-- <Q4 optional about availability/notice period>
-- <Q5 optional about location/remote preference if relevant>
+- <Q1 about JD core>
+- <Q2 about a missing/weak skill>
+- <Q3 about domain/tools in JD>
+- <Q4 optional availability/notice>
+- <Q5 optional location/remote>
 ---END OUTPUT---
 
-Information to use:
-Job Description:
+Information:
+JD:
 {jd_text}
 
 Resume:
 {resume_text}
-
-Rules:
-- Do NOT say "my resume is attached" or write as if you are the candidate.
-- Keep tone professional and positive.
 """
-    return call_gemini(prompt)
+    return call_text(prompt)
 
 # ---------- Session state ----------
 if "results" not in st.session_state:
@@ -268,47 +302,45 @@ if st.button("🔁 Start New Matching Session"):
 jd_file = st.file_uploader("📄 Upload Job Description", type=["txt", "pdf", "docx"], key="jd_uploader")
 resume_files = st.file_uploader("📑 Upload Candidate Resumes", type=["txt", "pdf", "docx"], accept_multiple_files=True, key="resume_uploader")
 
-# ✅ Store JD once
+# Store JD
 if jd_file and not st.session_state.get("jd_text"):
-    jd_text = read_file(jd_file)
-    st.session_state["jd_text"] = jd_text
+    st.session_state["jd_text"] = normalize_text(read_file(jd_file))
     st.session_state["jd_file"] = jd_file.name
 
 jd_text = st.session_state.get("jd_text", "")
 
 # Run
 if st.button("🚀 Run Matching") and jd_text and resume_files:
+    jd_facts = extract_jd_facts(jd_text)
+
     for resume_file in resume_files:
         if resume_file.name in st.session_state["processed_resumes"]:
             continue
 
-        resume_text = read_file(resume_file)
-        correct_name = extract_candidate_name(resume_text, resume_file.name)
-        correct_email = extract_email(resume_text)
+        resume_text_raw = read_file(resume_file)
+        resume_text = normalize_text(resume_text_raw)
 
-        with st.spinner(f"🔎 Analyzing {correct_name}..."):
-            result = compare_resume(jd_text, resume_text, correct_name)
-            # Extra safety (should be redundant, but fine to keep)
-            result = enforce_markdown(result)
+        name = extract_candidate_name(resume_text, resume_file.name)
+        email = extract_email(resume_text)
 
-        # Robust score extraction
-        score_match = re.search(r"\*\*Score\*\*:\s*\[(\d{1,3})\]%", result)
-        if not score_match:
-            score_match = re.search(r"\*\*Score\*\*:\s*(\d{1,3})%", result)
-        score = int(score_match.group(1)) if score_match else 0
+        with st.spinner(f"🔎 Analyzing {name}..."):
+            cv_facts = extract_resume_facts(resume_text)
+            score = compute_score(jd_facts, cv_facts)
+            matched, missing = gaps_and_matches(jd_facts, cv_facts)
+            reason = build_reason_text(jd_facts, cv_facts)
+            result_md = render_markdown(name, score, matched, missing, reason)
 
         st.session_state["results"].append({
-            "correct_name": correct_name,
-            "email": correct_email,
+            "correct_name": name,
+            "email": email,
             "score": score,
-            "result": result,
+            "result": result_md,
             "resume_text": resume_text
         })
         st.session_state["processed_resumes"].add(resume_file.name)
-
         st.session_state["summary"].append({
-            "Candidate Name": correct_name,
-            "Email": correct_email,
+            "Candidate Name": name,
+            "Email": email,
             "Score": score
         })
 
@@ -319,10 +351,10 @@ for entry in st.session_state["results"]:
     st.markdown(f"📧 **Email**: {entry['email']}")
     st.markdown(entry["result"], unsafe_allow_html=True)
 
-    score = entry["score"]
-    if score < 50:
+    s = entry["score"]
+    if s < 50:
         st.error("❌ Not suitable – Major role mismatch")
-    elif score < 70:
+    elif s < 70:
         st.warning("⚠️ Consider with caution – Lacks core skills")
     else:
         st.success("✅ Strong match – Good alignment with JD")
