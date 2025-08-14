@@ -1,61 +1,49 @@
-# app_gemini_gpt_parity.py
+# recruiter_matcher_dynamic.py
 import streamlit as st
-import io, re, json, numpy as np
-import pandas as pd
+import re, io, json, math
 import fitz  # PyMuPDF
 import docx
-import spacy
-from sentence_transformers import SentenceTransformer, util
+import pandas as pd
 
-# Optional (only for follow-ups; scoring does NOT use LLM)
+# --------- Optional LLM (Gemini) for STRUCTURED extraction ---------
 import google.generativeai as genai
 
-# -------------------- CONFIG --------------------
-st.set_page_config(page_title="Resume Matcher (Gemini – GPT-parity)", layout="centered")
-st.title("📌 Terrabit Consulting Talent Match System")
-st.caption("Deterministic scoring with skill taxonomy + semantic similarity (model-agnostic).")
+# ===================== Page =====================
+st.set_page_config(page_title="Recruiter Matcher (Gemini | Dynamic)", layout="centered")
+st.title("📌 Terrabit Consulting – Recruiter Matcher")
+st.write("Upload **one Job Description** and **multiple Resumes**. Get match scores, reasoning, and follow-ups.")
 
-# Weights for final score (sum ≈ 1.0)
-WEIGHTS = {
-    "skill_overlap": 0.55,   # Jaccard overlap of JD vs Resume skills
-    "semantic_sim": 0.25,    # Embedding similarity of JD vs Resume
-    "title_align":  0.10,    # QA/Tester vs Dev emphasis
-    "years_fit":    0.10,    # Resume years vs JD min years (if any)
-    # Optional location/domain can be added if you want
-}
+# ===================== Configure Gemini =====================
+if "GEMINI_API_KEY" not in st.secrets:
+    st.error("Please set GEMINI_API_KEY in Streamlit secrets.")
+    st.stop()
 
-# Calibration to match your GPT scale (adjust if needed)
-CALIB = {"scale": 1.03, "offset": 3}  # mild boost
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-# Use Gemini for follow-ups (set your key in secrets). If not present, we skip.
-USE_GEMINI_FOLLOWUP = "GEMINI_API_KEY" in st.secrets
+# JSON extractor (forces JSON so we never scrape Markdown)
+gemini_json = genai.GenerativeModel(
+    "gemini-1.5-flash",
+    generation_config={
+        "temperature": 0,
+        "top_p": 0.1,
+        "top_k": 1,
+        "max_output_tokens": 2048,
+        "response_mime_type": "application/json",
+    },
+)
 
-# -------------------- MODELS --------------------
-@st.cache_resource
-def load_spacy():
-    return spacy.load("en_core_web_sm")
+# Short-text generator (follow-ups only; not used in scoring)
+gemini_text = genai.GenerativeModel(
+    "gemini-1.5-flash",
+    generation_config={"temperature": 0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 1024},
+)
 
-@st.cache_resource
-def load_sbert():
-    # small, fast, accurate enough for similarity
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-nlp = load_spacy()
-sbert = load_sbert()
-
-if USE_GEMINI_FOLLOWUP:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    from google.generativeai import GenerativeModel
-    gemini_text = GenerativeModel("gemini-1.5-flash",
-        generation_config={"temperature": 0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 1024}
-    )
-
-# -------------------- IO UTILS --------------------
+# ===================== File Readers =====================
 def read_pdf(file):
     text = ""
     with fitz.open(stream=file.read(), filetype="pdf") as doc:
-        for page in doc:
-            text += page.get_text("text")
+        for p in doc:
+            text += p.get_text("text")
     return text
 
 def read_docx(file):
@@ -90,28 +78,55 @@ def normalize_text(t: str, max_chars=60000) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()[:max_chars]
 
-# -------------------- BASIC EXTRACTORS --------------------
+# ===================== Light NLP Helpers (no external libs) =====================
+STOP = set("""
+a an the and or of to in for on with without by from as at into over under be is are was were been being have has had do does did
+this that these those it its their his her your our my we they he she i you them him her
+about across after against among around before behind below beneath beside between beyond during except inside near outside since through
+than till until up upon within within without while system systems software hardware tool tools framework frameworks language languages
+""".split())
+
+def tokenize(text):
+    # lower, keep words, numbers & plus/dot
+    toks = re.findall(r"[a-zA-Z0-9\+\#\.\-]+", text.lower())
+    return [t for t in toks if t not in STOP and len(t) > 1]
+
+def bow(text):
+    counts = {}
+    for t in tokenize(text):
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+
+def cosine_sim(a_counts, b_counts):
+    if not a_counts or not b_counts: return 0.0
+    # dot
+    dot = 0.0
+    for k, v in a_counts.items():
+        if k in b_counts:
+            dot += v * b_counts[k]
+    # norms
+    na = math.sqrt(sum(v*v for v in a_counts.values()))
+    nb = math.sqrt(sum(v*v for v in b_counts.values()))
+    if na == 0 or nb == 0: return 0.0
+    return float(dot / (na * nb))
+
 def extract_email(text):
-    m = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
+    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
     return m.group() if m else "Not found"
 
 def extract_candidate_name(text, filename):
-    # Table/label
     m = re.search(r"(?i)Candidate Name\s*[:–-]\s*(.+)", text)
     if m:
         nm = re.sub(r"[^A-Za-z \-']", " ", m.group(1)).strip()
         if 2 <= len(nm.split()) <= 4:
             return nm.title()
-    # Footer-like
     m = re.search(r"(?i)Resume of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", text)
     if m:
         return m.group(1).strip().title()
-    # Top lines heuristic
     first = "\n".join(text.splitlines()[:15])
     m = re.search(r"(?m)^\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*$", first)
     if m:
         return m.group(1).strip().title()
-    # Filename fallback
     base = re.sub(r"\.(pdf|docx|txt)$", "", filename, flags=re.I)
     base = re.sub(r"[_\-]+", " ", base)
     cand = re.sub(r"[^A-Za-z \-']", " ", base).strip()
@@ -119,143 +134,156 @@ def extract_candidate_name(text, filename):
         return cand.title()
     return "Name Not Found"
 
-def extract_min_years_from_jd(jd):
-    # Look for "X+ years", "at least X years", etc. Return max value found.
-    nums = re.findall(r"(?i)(?:at least|minimum|min)?\s*(\d+)\s*\+?\s*(?:years|yrs)", jd)
+def extract_min_years(text):
+    # returns the largest years requirement mentioned
+    nums = re.findall(r"(?i)(?:at\s+least|min(?:imum)?)\s*(\d+)\s*\+?\s*(?:years|yrs)|(\d+)\s*\+?\s*(?:years|yrs)\s+(?:of|in)", text)
+    vals = []
+    for a, b in nums:
+        if a: vals.append(int(a))
+        elif b: vals.append(int(b))
+    return max(vals) if vals else 0
+
+def extract_years_from_resume(text):
+    nums = re.findall(r"(?i)(\d+)\s*\+?\s*(?:years|yrs)", text)
     return max([int(n) for n in nums], default=0)
 
-def extract_years_from_resume(resume):
-    # Max years mentioned anywhere (rough heuristic)
-    nums = re.findall(r"(?i)(\d+)\s*\+?\s*(?:years|yrs)", resume)
-    return max([int(n) for n in nums], default=0)
-
-# -------------------- SKILL TAXONOMY --------------------
-# Canonical skill -> list of regex patterns (lowercase)
-SKILL_MAP = {
-    # QA/Testing core
-    "qa": [r"\bqa\b", r"\bquality assurance\b"],
-    "testing": [r"\btesting\b"],
-    "manual testing": [r"\bmanual testing\b"],
-    "functional testing": [r"\bfunctional testing\b", r"\bsystem testing\b"],
-    "regression testing": [r"\bregression testing\b"],
-    "performance testing": [r"\bperformance testing\b"],
-    "automation": [r"\bautomation testing\b", r"\btest automation\b", r"\bsdet\b"],
-    "selenium": [r"\bselenium\b", r"\bwebdriver\b"],
-    "sit": [r"\bsit\b"],
-    "uat": [r"\buat\b"],
-    "pst": [r"\bpst\b"],
-
-    # CI/CD & DevOps
-    "ci/cd": [r"\bci/?cd\b", r"\bjenkins\b", r"\bazure devops\b", r"\bgitlab ci\b", r"\bansible\b", r"\bopenshift\b"],
-    "docker": [r"\bdocker\b"],
-    "kubernetes": [r"\bkubernetes\b"],
-
-    # DB / backend
-    "sql": [r"\bsql\b", r"\bpl\s*sql\b", r"\boracle sql\b"],
-    "oracle": [r"\boracle\b"],
-    "linux": [r"\blinux\b", r"\bunix\b", r"\bbash\b"],
-    "rest": [r"\brest\b"],
-    "java": [r"\bjava\b", r"\bspring boot\b"],
-    "microservices": [r"\bmicroservices?\b"],
-
-    # Security tools
-    "security tools": [r"\bsonarqube\b", r"\bfortify\b", r"\bburp suite\b"],
+# ===================== LLM JSON Extraction =====================
+JD_SCHEMA = {
+    "role_titles": ["e.g., QA Engineer, Backend Developer, Data Engineer"],
+    "required_skills": ["list of concrete hard skills (tools, frameworks, languages)"],
+    "optional_skills": ["nice-to-have skills"],
+    "domain_keywords": ["e.g., fintech, insurance, retail"],
+    "location_keywords": ["cities/regions or 'remote'/'hybrid'"],
 }
 
-def find_skills(text: str):
-    t = text.lower()
-    found = []
-    for canon, patterns in SKILL_MAP.items():
-        for p in patterns:
-            if re.search(p, t):
-                found.append(canon)
-                break
-    # de-dupe keep order
+RESUME_SCHEMA = {
+    "role_titles": ["candidate titles"],
+    "skills": ["candidate skills (tools, frameworks, languages)"],
+    "domain_keywords": ["domains mentioned"],
+    "location_keywords": ["locations mentioned"],
+}
+
+def call_json(prompt: str, schema_hint: dict) -> dict:
+    try:
+        resp = gemini_json.generate_content(
+            f"Return valid JSON only. Follow this minimal shape (keys only, types implied):\n"
+            f"{json.dumps(schema_hint, indent=2)}\n\n---\n{prompt}"
+        )
+        txt = getattr(resp, "text", "") or "{}"
+        return json.loads(txt)
+    except Exception as e:
+        st.error(f"Gemini JSON error: {e}")
+        return {}
+
+def to_list(x):
+    if x is None: return []
+    if isinstance(x, list): return [str(i).strip() for i in x if str(i).strip()]
+    parts = re.split(r"[;,|\n]+", str(x))
+    return [p.strip() for p in parts if p.strip()]
+
+def canonicalize(items):
+    # generic normalization: lowercase, strip punctuation, keep short tokens joined
+    out = []
+    for it in items:
+        s = re.sub(r"[^a-zA-Z0-9\+\#\.\- ]", " ", it.lower()).strip()
+        s = re.sub(r"\s+", " ", s)
+        if s: out.append(s)
+    # de-dupe preserve order
     seen, res = set(), []
-    for s in found:
-        if s not in seen:
-            seen.add(s); res.append(s)
+    for x in out:
+        if x not in seen:
+            seen.add(x); res.append(x)
     return res
 
-# -------------------- SEMANTIC SIMILARITY --------------------
-def chunk_text(text, chunk_chars=1200, overlap=150):
-    text = re.sub(r"\s+", " ", text)
-    chunks = []
-    i = 0
-    while i < len(text):
-        chunks.append(text[i:i+chunk_chars])
-        i += max(chunk_chars - overlap, 1)
-    return chunks or [""]
+def extract_jd_facts(jd_text):
+    prompt = f"""Extract concise JD facts as JSON.
+- Return short, canonical skill names (e.g., 'java', 'spring boot', 'selenium', 'azure devops', 'oracle', 'pl/sql', 'spark').
+- Ignore soft skills and responsibilities.
+JD:
+{jd_text}"""
+    raw = call_json(prompt, JD_SCHEMA)
+    return {
+        "role_titles": canonicalize(to_list(raw.get("role_titles"))),
+        "required_skills": canonicalize(to_list(raw.get("required_skills"))),
+        "optional_skills": canonicalize(to_list(raw.get("optional_skills"))),
+        "domain_keywords": canonicalize(to_list(raw.get("domain_keywords"))),
+        "location_keywords": canonicalize(to_list(raw.get("location_keywords"))),
+        "min_years": extract_min_years(jd_text),
+    }
 
-@st.cache_resource
-def _embed_cache(_model_name="all-MiniLM-L6-v2"):
-    return SentenceTransformer(_model_name)
+def extract_resume_facts(resume_text):
+    prompt = f"""Extract concise resume facts as JSON.
+- Return short, canonical skill names (e.g., 'java', 'oracle', 'selenium', 'jenkins').
+- Ignore job responsibilities sentences.
+Resume:
+{resume_text}"""
+    raw = call_json(prompt, RESUME_SCHEMA)
+    return {
+        "role_titles": canonicalize(to_list(raw.get("role_titles"))),
+        "skills": canonicalize(to_list(raw.get("skills"))),
+        "domain_keywords": canonicalize(to_list(raw.get("domain_keywords"))),
+        "location_keywords": canonicalize(to_list(raw.get("location_keywords"))),
+        "years_overall": extract_years_from_resume(resume_text),
+    }
 
-def semantic_similarity(jd_text, resume_text, topk=3):
-    # chunk resume → compute cosine sim against JD; avg top-k
-    jd_emb = sbert.encode([jd_text], normalize_embeddings=True)
-    chunks = chunk_text(resume_text)
-    res_emb = sbert.encode(chunks, normalize_embeddings=True)
-    sims = util.cos_sim(jd_emb, res_emb).cpu().numpy()[0]  # shape (n_chunks,)
-    if sims.size == 0:
-        return 0.0
-    sims.sort()  # ascending
-    top = sims[-topk:] if sims.size >= topk else sims
-    return float(np.mean(top))  # 0..1
+# ===================== Scoring =====================
+WEIGHTS = {
+    "required_overlap": 0.55,   # required skill hit
+    "optional_overlap": 0.10,   # nice to have
+    "title_align":      0.15,   # generic alignment
+    "years_fit":        0.10,   # regex-based
+    "cosine":           0.10,   # bag-of-words cosine
+}
 
-# -------------------- SCORING --------------------
+CALIB = {"scale": 1.02, "offset": 2}  # small bias to match typical GPT-ish scale
+
 def jaccard(a, b):
     A, B = set(a), set(b)
     if not A and not B: return 0.0
     return len(A & B) / len(A | B)
 
-def title_alignment_score(jd_text, resume_text):
-    jd = jd_text.lower(); cv = resume_text.lower()
-    qa_like = any(k in jd for k in ["qa","testing","tester","sdet"])
-    qa_hit  = any(k in cv for k in ["qa","testing","tester","sdet"])
-    dev_like = any(k in jd for k in ["developer","software engineer"])
-    dev_hit  = any(k in cv for k in ["developer","software engineer"])
-    # Favor QA/test alignment; penalize pure-dev for QA JDs
-    if qa_like and qa_hit: return 1.0
-    if qa_like and dev_hit and not qa_hit: return 0.2
-    if dev_like and dev_hit: return 0.7
-    return 0.5  # neutral
+def title_alignment(jd_titles, cv_titles):
+    # token overlap of titles (generic)
+    jd = set(tokenize(" ".join(jd_titles)))
+    cv = set(tokenize(" ".join(cv_titles)))
+    if not jd or not cv: return 0.5
+    inter = len(jd & cv); uni = len(jd | cv)
+    return inter / uni
 
-def years_fit_score(jd_min, cv_years):
-    if jd_min <= 0:
-        return 1.0  # no requirement
-    if cv_years <= 0:
-        return 0.0
-    ratio = cv_years / max(jd_min, 1)
-    return float(min(ratio, 1.0))  # cap at 1
+def years_fit(jd_min, cv_years):
+    if jd_min <= 0: return 1.0
+    if cv_years <= 0: return 0.0
+    return min(cv_years / jd_min, 1.0)
 
-def compute_score(jd_text, resume_text):
-    jd_sk = find_skills(jd_text)
-    cv_sk = find_skills(resume_text)
+def compute_score(jd_text, resume_text, jd_facts, cv_facts):
+    # Assemble skill sets
+    jd_required = jd_facts["required_skills"]
+    jd_optional = jd_facts["optional_skills"]
+    cv_all      = cv_facts["skills"]
 
-    skill_overlap = jaccard(jd_sk, cv_sk)                       # 0..1
-    sim            = semantic_similarity(jd_text, resume_text)   # 0..1
-    title_align    = title_alignment_score(jd_text, resume_text) # 0..1
-    jd_min_years   = extract_min_years_from_jd(jd_text)
-    cv_years       = extract_years_from_resume(resume_text)
-    years_ok       = years_fit_score(jd_min_years, cv_years)     # 0..1
+    req_overlap = jaccard(jd_required, cv_all)
+    opt_overlap = jaccard(jd_optional, cv_all) if jd_optional else 0.0
+    title_align = title_alignment(jd_facts["role_titles"], cv_facts["role_titles"])
+    yrs_fit     = years_fit(jd_facts["min_years"], cv_facts["years_overall"])
+    cos         = cosine_sim(bow(jd_text), bow(resume_text))
 
-    # Weighted sum
     raw = (
-        WEIGHTS["skill_overlap"] * skill_overlap +
-        WEIGHTS["semantic_sim"]  * sim +
-        WEIGHTS["title_align"]   * title_align +
-        WEIGHTS["years_fit"]     * years_ok
+        WEIGHTS["required_overlap"] * req_overlap +
+        WEIGHTS["optional_overlap"] * opt_overlap +
+        WEIGHTS["title_align"]      * title_align +
+        WEIGHTS["years_fit"]        * yrs_fit +
+        WEIGHTS["cosine"]           * cos
     )
-    # Calibration & clamp
     score = raw * 100.0
     score = score * CALIB["scale"] + CALIB["offset"]
-    return int(max(0, min(100, round(score)))), jd_sk, cv_sk, jd_min_years, cv_years
+    score = int(max(0, min(100, round(score))))
+    # what matched / missing (for explanation)
+    matched = sorted(list(set(jd_required) & set(cv_all)))
+    missing = sorted(list(set(jd_required) - set(cv_all)))
+    return score, matched, missing
 
-# -------------------- FOLLOW-UPS (LLM OPTIONAL) --------------------
+# ===================== Follow-ups =====================
 def generate_followup(jd_text, resume_text, candidate_name):
-    if not USE_GEMINI_FOLLOWUP:
-        return "_Follow-up generation disabled (no GEMINI_API_KEY)._"
     prompt = f"""
 You are a recruiter at Terrabit Consulting writing to a candidate named {candidate_name}.
 Return exactly three sections:
@@ -266,7 +294,7 @@ Return exactly three sections:
 ### Email to Candidate
 Subject: Quick chat about a {{<role>}} opportunity at Terrabit Consulting
 Dear {candidate_name},
-<3–5 lines about fit based on their resume; ask for 2–3 preferred slots this week; polite close with signature placeholder>
+<3–5 lines about fit based on their resume; ask for 2–3 preferred slots this week; polite close>
 
 ### Screening Questions (Tailored)
 - <Q1 about JD core>
@@ -286,36 +314,36 @@ Resume:
         resp = gemini_text.generate_content(prompt)
         return (getattr(resp, "text", "") or "").strip()
     except Exception as e:
-        return f"⚠️ Gemini follow-up failed: {e}"
+        return f"⚠️ Follow-up generation failed: {e}"
 
-# -------------------- UI STATE --------------------
-if "results" not in st.session_state:
-    st.session_state["results"] = []
-if "processed_resumes" not in st.session_state:
-    st.session_state["processed_resumes"] = set()
-if "jd_text" not in st.session_state:
-    st.session_state["jd_text"] = ""
-if "jd_file" not in st.session_state:
-    st.session_state["jd_file"] = None
-if "summary" not in st.session_state:
-    st.session_state["summary"] = []
+# ===================== Session State =====================
+if "results" not in st.session_state: st.session_state["results"] = []
+if "processed_resumes" not in st.session_state: st.session_state["processed_resumes"] = set()
+if "jd_text" not in st.session_state: st.session_state["jd_text"] = ""
+if "jd_file" not in st.session_state: st.session_state["jd_file"] = None
+if "summary" not in st.session_state: st.session_state["summary"] = []
 
+# Reset button → brand new session (so you can upload a completely different JD + resumes)
 if st.button("🔁 Start New Matching Session"):
     st.session_state.clear()
     st.rerun()
 
+# ===================== Uploaders =====================
 jd_file = st.file_uploader("📄 Upload Job Description", type=["txt", "pdf", "docx"], key="jd_uploader")
 resume_files = st.file_uploader("📑 Upload Candidate Resumes", type=["txt", "pdf", "docx"], accept_multiple_files=True, key="resume_uploader")
 
-# Store JD once
+# Keep JD for this run
 if jd_file and not st.session_state.get("jd_text"):
     st.session_state["jd_text"] = normalize_text(read_file(jd_file))
     st.session_state["jd_file"] = jd_file.name
 
 jd_text = st.session_state.get("jd_text", "")
 
-# -------------------- RUN --------------------
+# ===================== Run Matching =====================
 if st.button("🚀 Run Matching") and jd_text and resume_files:
+    # extract JD facts once
+    jd_facts = extract_jd_facts(jd_text)
+
     for resume_file in resume_files:
         if resume_file.name in st.session_state["processed_resumes"]:
             continue
@@ -325,29 +353,26 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
         email = extract_email(resume_text)
 
         with st.spinner(f"🔎 Analyzing {name}..."):
-            score, jd_sk, cv_sk, jd_min, cv_years = compute_score(jd_text, resume_text)
+            cv_facts = extract_resume_facts(resume_text)
+            score, matched, missing = compute_score(jd_text, resume_text, jd_facts, cv_facts)
 
-        # Reason lines
-        matched = sorted(set(jd_sk) & set(cv_sk))
-        missing = sorted(set(jd_sk) - set(cv_sk))
-        role_line = "Experience overlaps with JD focus" if "testing" in " ".join(cv_sk) or "qa" in " ".join(cv_sk) else "Resume emphasizes development more than testing"
+        warn = "\n\n**Warning**: Score below 70% – candidate may not meet core requirements." if score < 70 else ""
+        role_line = "Experience overlaps with JD focus" if title_alignment(jd_facts["role_titles"], cv_facts["role_titles"]) >= 0.5 else "Role emphasis differs from JD."
         gaps_line = []
         if score < 70:
-            if jd_min and cv_years < jd_min:
-                gaps_line.append(f"Insufficient years (JD: {jd_min}+ yrs, Resume: {cv_years} yrs)")
+            if jd_facts["min_years"] and cv_facts["years_overall"] < jd_facts["min_years"]:
+                gaps_line.append(f"Insufficient years (JD: {jd_facts['min_years']}+, Resume: {cv_facts['years_overall']})")
             if missing:
-                gaps_line.append(f"Missing core skills: {', '.join(missing)}")
-        gaps_line = "; ".join(gaps_line) if gaps_line else ("—" if score >= 70 else "Missing required tools or insufficient years")
+                gaps_line.append(f"Missing required skills: {', '.join(missing)}")
+        gaps_text = "; ".join(gaps_line) if gaps_line else ("—" if score >= 70 else "Missing core skills / insufficient years")
 
-        # Markdown like GPT
-        warn = "\n\n**Warning**: Score below 70% – candidate may not meet core testing specialization." if score < 70 else ""
         result_md = f"""**Name**: {name}
 **Score**: [{score}]%
 
 **Reason**:
 - **Role Match**: {role_line}
-- **Skill Match**: Matched skills: {', '.join(matched) if matched else 'None'}. Missing skills: {', '.join(missing) if missing else 'None'}.
-- **Major Gaps**: {gaps_line}{warn}
+- **Skill Match**: Matched: {', '.join(matched) if matched else 'None'}. Missing: {', '.join(missing) if missing else 'None'}.
+- **Major Gaps**: {gaps_text}{warn}
 """
 
         st.session_state["results"].append({
@@ -360,7 +385,7 @@ if st.button("🚀 Run Matching") and jd_text and resume_files:
         st.session_state["processed_resumes"].add(resume_file.name)
         st.session_state["summary"].append({"Candidate Name": name, "Email": email, "Score": score})
 
-# -------------------- RESULTS --------------------
+# ===================== Results =====================
 for entry in st.session_state["results"]:
     st.markdown("---")
     st.subheader(f"📌 {entry['correct_name']}")
@@ -377,29 +402,28 @@ for entry in st.session_state["results"]:
 
     if st.button(f"✉️ Generate Follow-up for {entry['correct_name']}", key=f"followup_{entry['correct_name']}"):
         with st.spinner("Generating messages..."):
-            followup = generate_followup(jd_text, entry["resume_text"], entry["correct_name"])
+            followup = generate_followup(st.session_state["jd_text"], entry["resume_text"], entry["correct_name"])
         st.markdown("---")
         st.markdown(followup, unsafe_allow_html=True)
 
-# -------------------- SUMMARY --------------------
+# ===================== Summary =====================
 if st.session_state["summary"]:
     st.markdown("### 📊 Summary of All Candidates")
     df_summary = pd.DataFrame(st.session_state["summary"]).sort_values(by="Score", ascending=False)
     st.dataframe(df_summary)
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-        df_summary.to_excel(writer, index=False)
+    xbuf = io.BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
+        df_summary.to_excel(w, index=False)
     st.download_button("📥 Download Summary as Excel",
-                       data=excel_buffer.getvalue(),
+                       data=xbuf.getvalue(),
                        file_name="resume_match_summary.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# -------------------- DEBUG --------------------
-with st.expander("🔍 Debug (skills & years)"):
+# ===================== Debug (optional) =====================
+with st.expander("🔍 Debug: last JD/Resume facts"):
     if st.session_state.get("jd_text"):
-        jd_sk_dbg = find_skills(st.session_state["jd_text"])
-        st.write("JD skills:", jd_sk_dbg)
-        st.write("JD min years (regex):", extract_min_years_from_jd(st.session_state["jd_text"]))
-    if st.session_state.get("results"):
-        last = st.session_state["results"][-1]
-        st.write("Last candidate raw years (regex):", extract_years_from_resume(last["resume_text"]))
+        st.write("JD facts (min years auto):")
+        try:
+            st.json(extract_jd_facts(st.session_state["jd_text"]))
+        except Exception:
+            st.caption("Upload & Run to view.")
