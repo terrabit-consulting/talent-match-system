@@ -1,44 +1,56 @@
-# recruiter_resume_matcher_gemini.py
+# app_gemini_gpt_parity.py
 import streamlit as st
-import time, io, re, json
+import io, re, json, numpy as np
+import pandas as pd
 import fitz  # PyMuPDF
 import docx
-import pandas as pd
 import spacy
+from sentence_transformers import SentenceTransformer, util
+
+# Optional (only for follow-ups; scoring does NOT use LLM)
 import google.generativeai as genai
 
-# -------------------- Page --------------------
-st.set_page_config(page_title="Resume Matcher (Gemini)", layout="centered")
+# -------------------- CONFIG --------------------
+st.set_page_config(page_title="Resume Matcher (Gemini – GPT-parity)", layout="centered")
 st.title("📌 Terrabit Consulting Talent Match System")
-st.write("Upload a JD and multiple resumes. Get match scores, red flags, and follow-up messaging.")
+st.caption("Deterministic scoring with skill taxonomy + semantic similarity (model-agnostic).")
 
-# -------------------- NLP ---------------------
+# Weights for final score (sum ≈ 1.0)
+WEIGHTS = {
+    "skill_overlap": 0.55,   # Jaccard overlap of JD vs Resume skills
+    "semantic_sim": 0.25,    # Embedding similarity of JD vs Resume
+    "title_align":  0.10,    # QA/Tester vs Dev emphasis
+    "years_fit":    0.10,    # Resume years vs JD min years (if any)
+    # Optional location/domain can be added if you want
+}
+
+# Calibration to match your GPT scale (adjust if needed)
+CALIB = {"scale": 1.03, "offset": 3}  # mild boost
+
+# Use Gemini for follow-ups (set your key in secrets). If not present, we skip.
+USE_GEMINI_FOLLOWUP = "GEMINI_API_KEY" in st.secrets
+
+# -------------------- MODELS --------------------
 @st.cache_resource
-def load_spacy_model():
+def load_spacy():
     return spacy.load("en_core_web_sm")
-nlp = load_spacy_model()
 
-# -------------------- Gemini ------------------
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+@st.cache_resource
+def load_sbert():
+    # small, fast, accurate enough for similarity
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-# JSON extractor (force JSON)
-gemini_json = genai.GenerativeModel(
-    "gemini-1.5-flash",
-    generation_config={
-        "temperature": 0,
-        "top_p": 0.1,
-        "top_k": 1,
-        "max_output_tokens": 2048,
-        "response_mime_type": "application/json"
-    }
-)
-# Text generator (for follow-ups)
-gemini_text = genai.GenerativeModel(
-    "gemini-1.5-flash",
-    generation_config={"temperature": 0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 1024}
-)
+nlp = load_spacy()
+sbert = load_sbert()
 
-# -------------------- IO utils ----------------
+if USE_GEMINI_FOLLOWUP:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    from google.generativeai import GenerativeModel
+    gemini_text = GenerativeModel("gemini-1.5-flash",
+        generation_config={"temperature": 0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 1024}
+    )
+
+# -------------------- IO UTILS --------------------
 def read_pdf(file):
     text = ""
     with fitz.open(stream=file.read(), filetype="pdf") as doc:
@@ -71,37 +83,35 @@ def read_file(file):
     else:
         return file.read().decode("utf-8", errors="ignore")
 
-def normalize_text(t: str, max_chars=40000) -> str:
+def normalize_text(t: str, max_chars=60000) -> str:
     if not t: return ""
     t = t.replace("\x00", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()[:max_chars]
 
-# ---------------- Email/Name ------------------
+# -------------------- BASIC EXTRACTORS --------------------
 def extract_email(text):
     m = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text)
     return m.group() if m else "Not found"
 
-def extract_candidate_name_from_table(text):
-    matches = re.findall(r"(?i)Candidate Name\s*[\t:–-]*\s*(.+)", text)
-    for match in matches:
-        nm = re.sub(r"[^A-Za-z \-']", "", match).strip()
+def extract_candidate_name(text, filename):
+    # Table/label
+    m = re.search(r"(?i)Candidate Name\s*[:–-]\s*(.+)", text)
+    if m:
+        nm = re.sub(r"[^A-Za-z \-']", " ", m.group(1)).strip()
         if 2 <= len(nm.split()) <= 4:
             return nm.title()
-    return None
-
-def extract_candidate_name_from_footer(text):
+    # Footer-like
     m = re.search(r"(?i)Resume of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})", text)
-    return m.group(1).strip().title() if m else None
-
-def extract_candidate_name(text, filename):
-    for fn in (extract_candidate_name_from_table, extract_candidate_name_from_footer):
-        nm = fn(text)
-        if nm: return nm
+    if m:
+        return m.group(1).strip().title()
+    # Top lines heuristic
     first = "\n".join(text.splitlines()[:15])
     m = re.search(r"(?m)^\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*$", first)
-    if m: return m.group(1).strip().title()
+    if m:
+        return m.group(1).strip().title()
+    # Filename fallback
     base = re.sub(r"\.(pdf|docx|txt)$", "", filename, flags=re.I)
     base = re.sub(r"[_\-]+", " ", base)
     cand = re.sub(r"[^A-Za-z \-']", " ", base).strip()
@@ -109,183 +119,143 @@ def extract_candidate_name(text, filename):
         return cand.title()
     return "Name Not Found"
 
-# --------------- Extraction (JSON) ------------
-JD_SCHEMA = {
-  "role_titles": ["list of JD role titles"],
-  "must_have_skills": ["hard skills/tools/frameworks"],
-  "nice_to_have_skills": ["optional skills"],
-  "min_years_core_stack": "integer years if specified else 0",
-  "domain_keywords": ["e.g., fintech, telecom, ecommerce"],
-  "location_keywords": ["city/country/remote/hybrid"]
-}
-RESUME_SCHEMA = {
-  "role_titles": ["candidate past/current titles"],
-  "skills": ["hard skills/tools/frameworks"],
-  "years_overall": "integer estimate",
-  "years_core_stack": "integer estimate for JD core skills",
-  "domain_keywords": ["industries mentioned"],
-  "location_keywords": ["locations mentioned"]
-}
+def extract_min_years_from_jd(jd):
+    # Look for "X+ years", "at least X years", etc. Return max value found.
+    nums = re.findall(r"(?i)(?:at least|minimum|min)?\s*(\d+)\s*\+?\s*(?:years|yrs)", jd)
+    return max([int(n) for n in nums], default=0)
 
-def call_json(prompt: str, schema_hint: dict) -> dict:
-    try:
-        resp = gemini_json.generate_content(
-            f"Return valid JSON only. Follow this shape (keys only, types implied):\n"
-            f"{json.dumps(schema_hint, indent=2)}\n\n---\n{prompt}"
-        )
-        txt = getattr(resp, "text", "") or "{}"
-        return json.loads(txt)
-    except Exception as e:
-        st.error(f"❌ Gemini JSON failed: {e}")
-        return {}
+def extract_years_from_resume(resume):
+    # Max years mentioned anywhere (rough heuristic)
+    nums = re.findall(r"(?i)(\d+)\s*\+?\s*(?:years|yrs)", resume)
+    return max([int(n) for n in nums], default=0)
 
-# --------------- Sanitizers & synonyms --------
-def to_years(x) -> int:
-    if x is None: return 0
-    if isinstance(x, (int, float)): return int(x)
-    if isinstance(x, list): 
-        vals = [to_years(i) for i in x]
-        return max(vals) if vals else 0
-    nums = re.findall(r"\d+", str(x))
-    return max(int(n) for n in nums) if nums else 0
+# -------------------- SKILL TAXONOMY --------------------
+# Canonical skill -> list of regex patterns (lowercase)
+SKILL_MAP = {
+    # QA/Testing core
+    "qa": [r"\bqa\b", r"\bquality assurance\b"],
+    "testing": [r"\btesting\b"],
+    "manual testing": [r"\bmanual testing\b"],
+    "functional testing": [r"\bfunctional testing\b", r"\bsystem testing\b"],
+    "regression testing": [r"\bregression testing\b"],
+    "performance testing": [r"\bperformance testing\b"],
+    "automation": [r"\bautomation testing\b", r"\btest automation\b", r"\bsdet\b"],
+    "selenium": [r"\bselenium\b", r"\bwebdriver\b"],
+    "sit": [r"\bsit\b"],
+    "uat": [r"\buat\b"],
+    "pst": [r"\bpst\b"],
 
-def to_list_str(x):
-    if x is None: return []
-    if isinstance(x, list): return [str(i).strip() for i in x if str(i).strip()]
-    parts = re.split(r"[;,|\n]+", str(x))
-    return [p.strip() for p in parts if p.strip()]
+    # CI/CD & DevOps
+    "ci/cd": [r"\bci/?cd\b", r"\bjenkins\b", r"\bazure devops\b", r"\bgitlab ci\b", r"\bansible\b", r"\bopenshift\b"],
+    "docker": [r"\bdocker\b"],
+    "kubernetes": [r"\bkubernetes\b"],
 
-# alias map collapses synonyms to a canonical token used in scoring
-ALIASES = {
-    # testing
-    "selenium": "selenium", "selenium webdriver": "selenium", "webdriver": "selenium",
-    "automation testing": "automation", "test automation": "automation", "sdet": "automation",
-    "manual testing": "manual testing", "functional testing": "functional testing",
-    "regression testing": "regression testing", "performance testing": "performance testing",
-    "sit": "sit", "uat": "uat", "pst": "pst", "system testing": "functional testing",
-    # ci/cd
-    "ci/cd": "ci/cd", "jenkins": "ci/cd", "azure devops": "ci/cd", "gitlab ci": "ci/cd",
-    "openshift": "ci/cd", "ansible": "ci/cd",
-    # db
-    "sql": "sql", "oracle": "oracle", "oracle sql": "sql", "plsql": "sql",
-    # os
-    "linux": "linux", "unix": "linux", "bash": "linux",
-    # dev
-    "java": "java", "spring boot": "java", "rest": "rest",
-    # tools
-    "sonarqube": "security tools", "fortify": "security tools", "burp suite": "security tools"
+    # DB / backend
+    "sql": [r"\bsql\b", r"\bpl\s*sql\b", r"\boracle sql\b"],
+    "oracle": [r"\boracle\b"],
+    "linux": [r"\blinux\b", r"\bunix\b", r"\bbash\b"],
+    "rest": [r"\brest\b"],
+    "java": [r"\bjava\b", r"\bspring boot\b"],
+    "microservices": [r"\bmicroservices?\b"],
+
+    # Security tools
+    "security tools": [r"\bsonarqube\b", r"\bfortify\b", r"\bburp suite\b"],
 }
 
-def canonicalize(skill: str) -> str:
-    s = re.sub(r"[^a-z0-9 +/.-]", " ", skill.lower()).strip()
-    s = re.sub(r"\s+", " ", s)
-    return ALIASES.get(s, s)
-
-def canon_list(items):
-    out = []
-    for it in items:
-        if not it: continue
-        c = canonicalize(it)
-        # split tokens like "java / spring boot"
-        for part in re.split(r"[+/]", c):
-            p = part.strip()
-            if p: out.append(p)
-    # de-dupe while preserving order
+def find_skills(text: str):
+    t = text.lower()
+    found = []
+    for canon, patterns in SKILL_MAP.items():
+        for p in patterns:
+            if re.search(p, t):
+                found.append(canon)
+                break
+    # de-dupe keep order
     seen, res = set(), []
-    for x in out:
-        if x not in seen:
-            seen.add(x); res.append(x)
+    for s in found:
+        if s not in seen:
+            seen.add(s); res.append(s)
     return res
 
-def sanitize_jd_facts(d: dict) -> dict:
-    return {
-        "role_titles": to_list_str(d.get("role_titles")),
-        "must_have_skills": canon_list(to_list_str(d.get("must_have_skills"))),
-        "nice_to_have_skills": canon_list(to_list_str(d.get("nice_to_have_skills"))),
-        "min_years_core_stack": to_years(d.get("min_years_core_stack")),
-        "domain_keywords": to_list_str(d.get("domain_keywords")),
-        "location_keywords": to_list_str(d.get("location_keywords")),
-    }
+# -------------------- SEMANTIC SIMILARITY --------------------
+def chunk_text(text, chunk_chars=1200, overlap=150):
+    text = re.sub(r"\s+", " ", text)
+    chunks = []
+    i = 0
+    while i < len(text):
+        chunks.append(text[i:i+chunk_chars])
+        i += max(chunk_chars - overlap, 1)
+    return chunks or [""]
 
-def sanitize_cv_facts(d: dict) -> dict:
-    return {
-        "role_titles": to_list_str(d.get("role_titles")),
-        "skills": canon_list(to_list_str(d.get("skills"))),
-        "years_overall": to_years(d.get("years_overall")),
-        "years_core_stack": to_years(d.get("years_core_stack")),
-        "domain_keywords": to_list_str(d.get("domain_keywords")),
-        "location_keywords": to_list_str(d.get("location_keywords")),
-    }
+@st.cache_resource
+def _embed_cache(_model_name="all-MiniLM-L6-v2"):
+    return SentenceTransformer(_model_name)
 
-def extract_jd_facts(jd_text: str) -> dict:
-    prompt = f"""Extract JD facts as JSON. Canonicalize concise skill names (e.g., 'Java', 'Selenium', 'CI/CD', 'Oracle', 'Linux').
-JD:
-{jd_text}"""
-    return sanitize_jd_facts(call_json(prompt, JD_SCHEMA))
+def semantic_similarity(jd_text, resume_text, topk=3):
+    # chunk resume → compute cosine sim against JD; avg top-k
+    jd_emb = sbert.encode([jd_text], normalize_embeddings=True)
+    chunks = chunk_text(resume_text)
+    res_emb = sbert.encode(chunks, normalize_embeddings=True)
+    sims = util.cos_sim(jd_emb, res_emb).cpu().numpy()[0]  # shape (n_chunks,)
+    if sims.size == 0:
+        return 0.0
+    sims.sort()  # ascending
+    top = sims[-topk:] if sims.size >= topk else sims
+    return float(np.mean(top))  # 0..1
 
-def extract_resume_facts(resume_text: str) -> dict:
-    prompt = f"""Extract resume facts as JSON. Canonicalize concise skill names (e.g., 'Java', 'Selenium', 'CI/CD', 'Oracle', 'Linux').
-Resume:
-{resume_text}"""
-    return sanitize_cv_facts(call_json(prompt, RESUME_SCHEMA))
-
-# ---------------- Scoring ---------------------
+# -------------------- SCORING --------------------
 def jaccard(a, b):
     A, B = set(a), set(b)
     if not A and not B: return 0.0
     return len(A & B) / len(A | B)
 
-def title_alignment(jd_titles, cv_titles):
-    jd = " ".join(jd_titles).lower()
-    cv = " ".join(cv_titles).lower()
-    keys = ["qa","quality","tester","testing","sdet","automation","developer","engineer"]
-    hits = sum(1 for k in keys if k in jd and k in cv)
-    return min(hits/3.0, 1.0)
+def title_alignment_score(jd_text, resume_text):
+    jd = jd_text.lower(); cv = resume_text.lower()
+    qa_like = any(k in jd for k in ["qa","testing","tester","sdet"])
+    qa_hit  = any(k in cv for k in ["qa","testing","tester","sdet"])
+    dev_like = any(k in jd for k in ["developer","software engineer"])
+    dev_hit  = any(k in cv for k in ["developer","software engineer"])
+    # Favor QA/test alignment; penalize pure-dev for QA JDs
+    if qa_like and qa_hit: return 1.0
+    if qa_like and dev_hit and not qa_hit: return 0.2
+    if dev_like and dev_hit: return 0.7
+    return 0.5  # neutral
 
-def keyword_hit(jd_kw, cv_kw):
-    return 1.0 if set([x.lower() for x in jd_kw]) & set([y.lower() for y in cv_kw]) else 0.0
+def years_fit_score(jd_min, cv_years):
+    if jd_min <= 0:
+        return 1.0  # no requirement
+    if cv_years <= 0:
+        return 0.0
+    ratio = cv_years / max(jd_min, 1)
+    return float(min(ratio, 1.0))  # cap at 1
 
-def compute_score(jd, cv):
-    hard = jaccard(jd.get("must_have_skills", []), cv.get("skills", []))
-    exp_core = cv.get("years_core_stack", 0)
-    min_core = jd.get("min_years_core_stack", 0)
-    exp_ratio = 1.0 if min_core == 0 else min(exp_core / max(min_core,1), 1.0)
-    title = title_alignment(jd.get("role_titles", []), cv.get("role_titles", []))
-    domain = keyword_hit(jd.get("domain_keywords", []), cv.get("domain_keywords", []))
-    location = keyword_hit(jd.get("location_keywords", []), cv.get("location_keywords", []))
-    score = 0.50*hard + 0.20*exp_ratio + 0.10*title + 0.10*domain + 0.10*location
-    return round(score*100)
+def compute_score(jd_text, resume_text):
+    jd_sk = find_skills(jd_text)
+    cv_sk = find_skills(resume_text)
 
-def gaps_and_matches(jd, cv):
-    must = set(jd.get("must_have_skills", []))
-    cv_sk = set(cv.get("skills", []))
-    return sorted(must & cv_sk), sorted(must - cv_sk)
+    skill_overlap = jaccard(jd_sk, cv_sk)                       # 0..1
+    sim            = semantic_similarity(jd_text, resume_text)   # 0..1
+    title_align    = title_alignment_score(jd_text, resume_text) # 0..1
+    jd_min_years   = extract_min_years_from_jd(jd_text)
+    cv_years       = extract_years_from_resume(resume_text)
+    years_ok       = years_fit_score(jd_min_years, cv_years)     # 0..1
 
-# -------------- Rendering (GPT-like) ----------
-def render_markdown(candidate_name, score, matched, missing, role_line, gaps_line):
-    warn = "\n\n**Warning**: Score below 70% – candidate may not meet core testing specialization." if score < 70 else ""
-    md = f"""**Name**: {candidate_name}
-**Score**: [{score}]%
+    # Weighted sum
+    raw = (
+        WEIGHTS["skill_overlap"] * skill_overlap +
+        WEIGHTS["semantic_sim"]  * sim +
+        WEIGHTS["title_align"]   * title_align +
+        WEIGHTS["years_fit"]     * years_ok
+    )
+    # Calibration & clamp
+    score = raw * 100.0
+    score = score * CALIB["scale"] + CALIB["offset"]
+    return int(max(0, min(100, round(score)))), jd_sk, cv_sk, jd_min_years, cv_years
 
-**Reason**:
-- **Role Match**: {role_line}
-- **Skill Match**: Matched skills: {', '.join(matched) if matched else 'None'}. Missing skills: {', '.join(missing) if missing else 'None'}.
-- **Major Gaps**: {gaps_line if gaps_line else ('No major gaps relative to JD.' if score >= 70 else 'Missing required tools or insufficient years on core stack.')}{warn}
-"""
-    return md.strip()
-
-def build_reason_lines(jd, cv, score):
-    role_line = "Experience overlaps with JD focus" if title_alignment(jd.get("role_titles", []), cv.get("role_titles", [])) >= 0.5 else "Resume focus differs from JD emphasis"
-    gaps = []
-    if score < 70:
-        if jd.get("min_years_core_stack", 0) > cv.get("years_core_stack", 0):
-            gaps.append("Insufficient years on core stack")
-        if not keyword_hit(jd.get("domain_keywords", []), cv.get("domain_keywords", [])):
-            gaps.append("Domain exposure not explicit")
-    return role_line, "; ".join(gaps)
-
-# -------------- Follow-up ---------------------
+# -------------------- FOLLOW-UPS (LLM OPTIONAL) --------------------
 def generate_followup(jd_text, resume_text, candidate_name):
+    if not USE_GEMINI_FOLLOWUP:
+        return "_Follow-up generation disabled (no GEMINI_API_KEY)._"
     prompt = f"""
 You are a recruiter at Terrabit Consulting writing to a candidate named {candidate_name}.
 Return exactly three sections:
@@ -296,7 +266,7 @@ Return exactly three sections:
 ### Email to Candidate
 Subject: Quick chat about a {{<role>}} opportunity at Terrabit Consulting
 Dear {candidate_name},
-<3–5 lines about fit based on resume; ask for 2–3 preferred slots this week; polite close with signature placeholder>
+<3–5 lines about fit based on their resume; ask for 2–3 preferred slots this week; polite close with signature placeholder>
 
 ### Screening Questions (Tailored)
 - <Q1 about JD core>
@@ -316,10 +286,9 @@ Resume:
         resp = gemini_text.generate_content(prompt)
         return (getattr(resp, "text", "") or "").strip()
     except Exception as e:
-        st.error(f"❌ Gemini text failed: {e}")
-        return "⚠️ Gemini processing failed."
+        return f"⚠️ Gemini follow-up failed: {e}"
 
-# ---------------- Session State ---------------
+# -------------------- UI STATE --------------------
 if "results" not in st.session_state:
     st.session_state["results"] = []
 if "processed_resumes" not in st.session_state:
@@ -331,12 +300,10 @@ if "jd_file" not in st.session_state:
 if "summary" not in st.session_state:
     st.session_state["summary"] = []
 
-# Reset
 if st.button("🔁 Start New Matching Session"):
     st.session_state.clear()
     st.rerun()
 
-# Uploaders
 jd_file = st.file_uploader("📄 Upload Job Description", type=["txt", "pdf", "docx"], key="jd_uploader")
 resume_files = st.file_uploader("📑 Upload Candidate Resumes", type=["txt", "pdf", "docx"], accept_multiple_files=True, key="resume_uploader")
 
@@ -347,40 +314,53 @@ if jd_file and not st.session_state.get("jd_text"):
 
 jd_text = st.session_state.get("jd_text", "")
 
-# ---------------- Run Matching ----------------
+# -------------------- RUN --------------------
 if st.button("🚀 Run Matching") and jd_text and resume_files:
-    jd_facts = extract_jd_facts(jd_text)
-
     for resume_file in resume_files:
         if resume_file.name in st.session_state["processed_resumes"]:
             continue
 
         resume_text = normalize_text(read_file(resume_file))
-        correct_name = extract_candidate_name(resume_text, resume_file.name)
-        correct_email = extract_email(resume_text)
+        name = extract_candidate_name(resume_text, resume_file.name)
+        email = extract_email(resume_text)
 
-        with st.spinner(f"🔎 Analyzing {correct_name}..."):
-            cv_facts = extract_resume_facts(resume_text)
-            score = compute_score(jd_facts, cv_facts)
-            matched, missing = gaps_and_matches(jd_facts, cv_facts)
-            role_line, gaps_line = build_reason_lines(jd_facts, cv_facts, score)
-            result_md = render_markdown(correct_name, score, matched, missing, role_line, gaps_line)
+        with st.spinner(f"🔎 Analyzing {name}..."):
+            score, jd_sk, cv_sk, jd_min, cv_years = compute_score(jd_text, resume_text)
+
+        # Reason lines
+        matched = sorted(set(jd_sk) & set(cv_sk))
+        missing = sorted(set(jd_sk) - set(cv_sk))
+        role_line = "Experience overlaps with JD focus" if "testing" in " ".join(cv_sk) or "qa" in " ".join(cv_sk) else "Resume emphasizes development more than testing"
+        gaps_line = []
+        if score < 70:
+            if jd_min and cv_years < jd_min:
+                gaps_line.append(f"Insufficient years (JD: {jd_min}+ yrs, Resume: {cv_years} yrs)")
+            if missing:
+                gaps_line.append(f"Missing core skills: {', '.join(missing)}")
+        gaps_line = "; ".join(gaps_line) if gaps_line else ("—" if score >= 70 else "Missing required tools or insufficient years")
+
+        # Markdown like GPT
+        warn = "\n\n**Warning**: Score below 70% – candidate may not meet core testing specialization." if score < 70 else ""
+        result_md = f"""**Name**: {name}
+**Score**: [{score}]%
+
+**Reason**:
+- **Role Match**: {role_line}
+- **Skill Match**: Matched skills: {', '.join(matched) if matched else 'None'}. Missing skills: {', '.join(missing) if missing else 'None'}.
+- **Major Gaps**: {gaps_line}{warn}
+"""
 
         st.session_state["results"].append({
-            "correct_name": correct_name,
-            "email": correct_email,
+            "correct_name": name,
+            "email": email,
             "score": score,
             "result": result_md,
             "resume_text": resume_text
         })
         st.session_state["processed_resumes"].add(resume_file.name)
-        st.session_state["summary"].append({
-            "Candidate Name": correct_name,
-            "Email": correct_email,
-            "Score": score
-        })
+        st.session_state["summary"].append({"Candidate Name": name, "Email": email, "Score": score})
 
-# ---------------- Results ---------------------
+# -------------------- RESULTS --------------------
 for entry in st.session_state["results"]:
     st.markdown("---")
     st.subheader(f"📌 {entry['correct_name']}")
@@ -398,29 +378,28 @@ for entry in st.session_state["results"]:
     if st.button(f"✉️ Generate Follow-up for {entry['correct_name']}", key=f"followup_{entry['correct_name']}"):
         with st.spinner("Generating messages..."):
             followup = generate_followup(jd_text, entry["resume_text"], entry["correct_name"])
-            st.markdown("---")
-            st.markdown(followup, unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown(followup, unsafe_allow_html=True)
 
-# ---------------- Summary + download ----------
+# -------------------- SUMMARY --------------------
 if st.session_state["summary"]:
     st.markdown("### 📊 Summary of All Candidates")
     df_summary = pd.DataFrame(st.session_state["summary"]).sort_values(by="Score", ascending=False)
     st.dataframe(df_summary)
-
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
         df_summary.to_excel(writer, index=False)
+    st.download_button("📥 Download Summary as Excel",
+                       data=excel_buffer.getvalue(),
+                       file_name="resume_match_summary.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    st.download_button(
-        label="📥 Download Summary as Excel",
-        data=excel_buffer.getvalue(),
-        file_name="resume_match_summary.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-# --------------- Debug (optional) -------------
-with st.expander("🔍 Debug: Extracted facts from last run"):
-    try:
-        st.write("JD facts:"); st.json(jd_facts)   # shown after a run
-    except Exception:
-        st.caption("Run the matcher to see JD facts.")
+# -------------------- DEBUG --------------------
+with st.expander("🔍 Debug (skills & years)"):
+    if st.session_state.get("jd_text"):
+        jd_sk_dbg = find_skills(st.session_state["jd_text"])
+        st.write("JD skills:", jd_sk_dbg)
+        st.write("JD min years (regex):", extract_min_years_from_jd(st.session_state["jd_text"]))
+    if st.session_state.get("results"):
+        last = st.session_state["results"][-1]
+        st.write("Last candidate raw years (regex):", extract_years_from_resume(last["resume_text"]))
